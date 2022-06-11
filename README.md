@@ -8,18 +8,18 @@ This is a small Rust program to use an asymmetric RSA key from AWS KMS as a sing
 
 ## Installation
 
-Requires AWS CLI on your `$PATH`.
-
 ```
 cargo install --git https://github.com/iliana/sshca
 ```
 
-Set up an environment file at `~/.config/sshca/env`, which should define `SSHCA_KEY_ID` with the KMS key ID. You can set other environment variables, which may assist with coercing the AWS CLI to find correct credentials.
+You must define `SSHCA_KEY_ID` in your environment with the KMS key ID. You can set other environment variables, which may assist with coercing the AWS SDK to find correct credentials.
+
+dotenv-style files are read from `~/.config/sshca/env` if that's your kind of thing.
 
 ## Usage
 
-* **`sshca pubkey`**: Outputs the public CA signing key in a form usable by `~/.ssh/authorized_keys`.
-* **`sshca sign`**: Signs `~/.ssh/id_ed25519.pub` with the CA signing key, writing the certificate to `~/.ssh/id_ed25519-cert.pub`.
+- **`sshca pubkey`**: Outputs the public CA signing key in a form usable by `~/.ssh/authorized_keys`.
+- **`sshca sign`**: Signs `~/.ssh/id_ed25519.pub` with the CA signing key, writing the certificate to `~/.ssh/id_ed25519-cert.pub`.
 
 sshca is licensed under the WTFPL.
 
@@ -29,10 +29,11 @@ I prefer to avoid copying SSH keys between machines; in the past I used the PGP 
 
 This is not a multi-user SSH CA. In my setup, I have a separate AWS account that stores the key for my SSH CA, accessible solely by me via AWS SSO with two-factor authentication. Anybody with access to the signing key can sign anything they like, including SSH certificates for indefinite periods of time. A multi-user SSH CA requires application code to validate a user's request before signing a key.
 
-Instead of using an AWS SDK, I opted to shell out to the AWS CLI, mainly to have support for complicated credential providers (e.g. AWS SSO, source profiles).
+~~Instead of using an AWS SDK, I opted to shell out to the AWS CLI, mainly to have support for complicated credential providers (e.g. AWS SSO, source profiles).~~ The AWS SDK for Rust has implemented pretty extensive credential provider support now! I switched to this in 0.2.0.
 
 Crates I used for the first time:
-* [sshcerts](https://docs.rs/sshcerts) is lovely, but could use additional example documentation. It was difficult to get going at first.
-* [cmd_lib](https://docs.rs/cmd_lib) has incredible macros for running shell commands without a shell and I strongly recommend it; I wish it were more flexible for displaying stderr without a logger set up.
 
-Parsing RSA keys out of `SubjectPublicKeyInfo` DER documents in Rust remains a total pain in the ass. This is about the fourth time I've had to do this.
+- [sshcerts](https://docs.rs/sshcerts) is lovely, but could use additional example documentation. It was difficult to get going at first.
+- [cmd_lib](https://docs.rs/cmd_lib) has incredible macros for running shell commands without a shell and I strongly recommend it; I wish it were more flexible for displaying stderr without a logger set up. (No longer used in 0.2.0.)
+
+~~Parsing RSA keys out of `SubjectPublicKeyInfo` DER documents in Rust remains a total pain in the ass. This is about the fourth time I've had to do this.~~ A combination of the `spki` and `pkcs1` crates now does the trick with minimal pain.

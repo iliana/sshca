@@ -1,132 +1,157 @@
-use anyhow::{anyhow, bail, ensure, Context, Result};
-use cmd_lib::run_fun;
-use der::{asn1::UIntBytes, Decodable, Message};
-use serde::Deserialize;
-use spki::SubjectPublicKeyInfo;
-use sshcerts::ssh::{
-    CertType, Certificate, Extensions, KeyType, PublicKey, PublicKeyKind, RsaPublicKey,
-};
-use std::convert::{TryFrom, TryInto};
-use std::env::{self, VarError};
-use std::fs;
-use std::path::{Path, PathBuf};
-use time::{Duration, OffsetDateTime};
+#![warn(clippy::pedantic)]
 
-macro_rules! env {
-    ($var:expr) => {
-        env::var_os($var).context(concat!("$", $var, " not set"))
-    };
+use anyhow::{bail, Context, Result};
+use aws_sdk_kms::{model::SigningAlgorithmSpec, types::Blob, Client};
+use camino::{Utf8Path, Utf8PathBuf};
+use spki::{der::Decode, SubjectPublicKeyInfo};
+use sshcerts::ssh::{KeyType, PublicKeyKind, RsaPublicKey, SSHCertificateSigner};
+use sshcerts::{CertType, Certificate, PublicKey};
+use std::env;
+use std::fmt::{self, Display};
+use std::fs::File;
+use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+lazy_static::lazy_static! {
+    // the `sshcerts` crate is not async-aware, so we only run async operations with
+    // `Runtime::block_on` where we need them
+    static ref RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build().unwrap();
 }
 
 fn main() -> Result<()> {
-    let home = PathBuf::from(env!("HOME")?);
-    dotenv::from_path(home.join(".config").join("sshca").join("env"))?;
+    let home = env_path("HOME")?;
+    home.as_ref()
+        .and_then(|home| dotenv::from_path(home.join(".config").join("sshca").join("env")).ok());
 
-    let user = env!("USER")?.into_string().map_err(VarError::NotUnicode)?;
+    let user = env::var("SSHCA_USER")
+        .or_else(|_| env::var("USER"))
+        .context("$SSHCA_USER and $USER not set")?;
+    let key_id = env::var("SSHCA_KEY_ID").context("$SSHCA_KEY_ID not set")?;
 
-    let mut args = std::env::args_os().skip(1);
-    match args.next().as_deref().and_then(|s| s.to_str()) {
-        Some("pubkey") => {
-            println!(
-                "cert-authority,principals=\"{user}\" {key}",
-                user = user,
-                key = get_ca_key()?
-            );
-            Ok(())
-        }
-        Some("sign") => sign_key(&home, &user),
+    let client = Client::new(&RT.block_on(aws_config::load_from_env()));
+    let key = Key::get(client, &key_id, user)?;
+
+    match env::args().nth(1).as_deref() {
+        Some("pubkey") => println!("{}", key),
+        Some("sign") => key.sign_path(&match env_path("SSHCA_KEY_PATH")? {
+            Some(path) => path,
+            None => home
+                .context("$SSHCA_KEY_PATH and $HOME not set")?
+                .join(".ssh")
+                .join("id_ed25519.pub"),
+        })?,
         _ => bail!("invalid command"),
     }
-}
 
-fn get_ca_key() -> Result<PublicKey> {
-    #[derive(Debug, Deserialize)]
-    #[serde(rename_all = "PascalCase")]
-    struct Response {
-        key_id: String,
-        public_key: String,
-        customer_master_key_spec: String,
-    }
-
-    #[derive(Debug, Message)]
-    struct RSAPublicKeySequence<'a> {
-        n: UIntBytes<'a>,
-        e: UIntBytes<'a>,
-    }
-
-    let key_id = env!("SSHCA_KEY_ID")?;
-    let response: Response =
-        serde_json::from_str(&run_fun!(aws kms get-public-key --key-id $key_id --output json)?)?;
-    ensure!(
-        response.customer_master_key_spec.starts_with("RSA_"),
-        "unsupported key type"
-    );
-
-    let der = base64::decode(&response.public_key)?;
-    let spki = SubjectPublicKeyInfo::from_der(der.as_slice()).map_err(|e| anyhow!(e))?;
-    let key = RSAPublicKeySequence::from_der(spki.subject_public_key).map_err(|e| anyhow!(e))?;
-
-    Ok(PublicKey {
-        key_type: KeyType::from_name("ssh-rsa")?,
-        kind: PublicKeyKind::Rsa(RsaPublicKey {
-            e: key.e.as_bytes().into(),
-            n: key.n.as_bytes().into(),
-        }),
-        comment: Some(response.key_id),
-    })
-}
-
-fn sign_key(home: &Path, user: &str) -> Result<()> {
-    let key_type = "ed25519";
-    let user_key = PublicKey::from_path(home.join(".ssh").join(format!("id_{}.pub", key_type)))?;
-    let signing_key = get_ca_key()?;
-    let key_id = signing_key
-        .comment
-        .as_ref()
-        .expect("get_ca_key() always returns a key with a comment");
-
-    let mut err = None;
-    let cert = Certificate::builder(&user_key, CertType::User, &signing_key)?
-        .principal(&user)
-        .key_id(&user)
-        .set_extensions(Extensions::Standard)
-        .valid_after(OffsetDateTime::now_utc().unix_timestamp().try_into()?)
-        .valid_before(
-            (OffsetDateTime::now_utc() + Duration::day())
-                .unix_timestamp()
-                .try_into()?,
-        )
-        .sign(|data| match signer(data, key_id) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                err = Some(e);
-                None
-            }
-        });
-    if let Some(err) = err {
-        return Err(err);
-    }
-    let cert = cert?;
-    fs::write(
-        home.join(".ssh").join(format!("id_{}-cert.pub", key_type)),
-        format!("{}\n", cert),
-    )?;
     Ok(())
 }
 
-fn signer(data: &[u8], key_id: &str) -> Result<Vec<u8>> {
-    let sig_type = "rsa-sha2-512";
-    let data = base64::encode(data);
+#[derive(Debug)]
+struct Key {
+    client: Client,
+    public_key: PublicKey,
+    signing_algorithm: SigningAlgorithmSpec,
+    user: String,
+}
 
-    let signature = base64::decode(
-        &run_fun!(aws kms sign --key-id $key_id --message $data --query Signature --output text
-            --signing-algorithm RSASSA_PKCS1_V1_5_SHA_512)?,
-    )?;
+impl Key {
+    fn get(client: Client, key_id: &str, user: String) -> Result<Key> {
+        let response = RT.block_on(client.get_public_key().key_id(key_id).send())?;
+        let key_id = response
+            .key_id
+            .context("GetPublicKey response missing `key_id` field")?;
 
-    let mut result = Vec::new();
-    result.extend(u32::try_from(sig_type.len())?.to_be_bytes());
-    result.extend(sig_type.as_bytes());
-    result.extend(u32::try_from(signature.len())?.to_be_bytes());
-    result.extend(signature);
-    Ok(result)
+        let der = response
+            .public_key
+            .context("GetPublicKey response missing `public_key` field")?;
+        let spki = SubjectPublicKeyInfo::from_der(der.as_ref())?;
+
+        Ok(match spki.algorithm {
+            pkcs1::ALGORITHM_ID => {
+                let key = pkcs1::RsaPublicKey::from_der(spki.subject_public_key)?;
+                Key {
+                    client,
+                    public_key: PublicKey {
+                        key_type: KeyType::from_name("ssh-rsa")?,
+                        kind: PublicKeyKind::Rsa(RsaPublicKey {
+                            e: key.public_exponent.as_bytes().into(),
+                            n: key.modulus.as_bytes().into(),
+                        }),
+                        comment: Some(key_id),
+                    },
+                    signing_algorithm: SigningAlgorithmSpec::RsassaPkcs1V15Sha512,
+                    user,
+                }
+            }
+            _ => bail!("unsupported key algorithm"),
+        })
+    }
+
+    fn sign_path(&self, path: &Utf8Path) -> Result<()> {
+        let out = cert_path(path).context("could not automatically determine output path")?;
+
+        let key = PublicKey::from_path(path)
+            .with_context(|| format!("failed to load public key at {}", path))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("it is not yet 1970")?
+            .as_secs();
+        let cert = Certificate::builder(&key, CertType::User, &self.public_key)?
+            .principal(&self.user)
+            .key_id(&self.user)
+            .set_extensions(Certificate::standard_extensions())
+            .valid_after(now)
+            .valid_before(now + 86400)
+            .sign(self)?;
+
+        let mut file = File::create(out)?;
+        writeln!(file, "{}", cert)?;
+        Ok(())
+    }
+
+    fn key_id(&self) -> &str {
+        self.public_key.comment.as_ref().unwrap()
+    }
+}
+
+impl Display for Key {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "cert-authority,principals=\"{user}\" {key}",
+            user = self.user,
+            key = self.public_key
+        )
+    }
+}
+
+impl SSHCertificateSigner for Key {
+    fn sign(&self, data: &[u8]) -> Option<Vec<u8>> {
+        let response = RT
+            .block_on(
+                self.client
+                    .sign()
+                    .key_id(self.key_id())
+                    .message(Blob::new(data))
+                    .signing_algorithm(self.signing_algorithm.clone())
+                    .send(),
+            )
+            .ok()?;
+        sshcerts::utils::format_signature_for_ssh(&self.public_key, response.signature?.as_ref())
+    }
+}
+
+fn env_path(key: &str) -> Result<Option<Utf8PathBuf>> {
+    Ok(match env::var_os(key) {
+        Some(value) => Some(Utf8PathBuf::try_from(std::path::PathBuf::from(value))?),
+        None => None,
+    })
+}
+
+fn cert_path(path: &Utf8Path) -> Option<Utf8PathBuf> {
+    path.file_name()
+        .and_then(|name| name.strip_suffix(".pub"))
+        .map(|name| path.with_file_name(format!("{}-cert.pub", name)))
 }
