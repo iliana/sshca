@@ -1,9 +1,10 @@
 #![warn(clippy::pedantic)]
+#![allow(clippy::uninlined_format_args)]
 
 use anyhow::{bail, Context, Result};
-use aws_sdk_kms::{model::SigningAlgorithmSpec, types::Blob, Client};
+use aws_sdk_kms::{primitives::Blob, types::SigningAlgorithmSpec, Client};
 use camino::{Utf8Path, Utf8PathBuf};
-use spki::{der::Decode, SubjectPublicKeyInfo};
+use spki::{der::Decode, SubjectPublicKeyInfoRef};
 use sshcerts::ssh::{KeyType, PublicKeyKind, RsaPublicKey, SSHCertificateSigner};
 use sshcerts::{CertType, Certificate, PublicKey};
 use std::env;
@@ -23,7 +24,7 @@ lazy_static::lazy_static! {
 fn main() -> Result<()> {
     let home = env_path("HOME")?;
     home.as_ref()
-        .and_then(|home| dotenv::from_path(home.join(".config").join("sshca").join("env")).ok());
+        .and_then(|home| dotenvy::from_path(home.join(".config").join("sshca").join("env")).ok());
 
     let user = env::var("SSHCA_USER")
         .or_else(|_| env::var("USER"))
@@ -66,11 +67,11 @@ impl Key {
         let der = response
             .public_key
             .context("GetPublicKey response missing `public_key` field")?;
-        let spki = SubjectPublicKeyInfo::from_der(der.as_ref())?;
+        let spki = SubjectPublicKeyInfoRef::try_from(der.as_ref())?;
 
         Ok(match spki.algorithm {
             pkcs1::ALGORITHM_ID => {
-                let key = pkcs1::RsaPublicKey::from_der(spki.subject_public_key)?;
+                let key = pkcs1::RsaPublicKey::from_der(spki.subject_public_key.raw_bytes())?;
                 Key {
                     client,
                     public_key: PublicKey {
